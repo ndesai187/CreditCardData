@@ -1,0 +1,388 @@
+---
+title: "EDA_credit_card_marketing_campaign"
+author: "Group 18"
+date: "9/20/2019"
+output: html_document
+---
+
+## PART 2 - Extreme Gradient Boosted Trees with XGBoost
+
+#### Load required libraries
+```{r, warning=FALSE, message=FALSE}
+library(caret)
+library(MASS)
+library(tidyverse)
+library(tidyr)
+library(ggplot2)
+library(ggthemes)
+library(dplyr)
+library(mlbench)
+library(class)
+library(pROC)
+library(ROSE)
+library(e1071)
+library(gplots)
+library(glmnet)
+library(ISLR)
+library(viridis)
+library(gridExtra)
+library(grid)
+library(DMwR)
+library(xgboost)
+```
+
+### Load Credit Card Dataset
+
+```{r, fig.width=15, fig.height=6, warning=FALSE}
+# Loading the data
+rm(list=ls())
+credit.data.csv <- read.csv("creditcardmarketing-bbm.csv")
+
+# Remove the ID column "Customer.Number" which is not helpful in the model
+credit.data.csv <- credit.data.csv[, -1]
+
+# Overview the data
+des.data <- matrix(nrow = ncol(credit.data.csv),
+                 ncol = 13,
+                 dimnames = list(colnames(credit.data.csv),
+                                 c("Type", "Records", "MissingValue",
+                                   "Min", "1st Quatile", "Median",
+                                   "3rd Quatile", "Max", "Mean",
+                                   "StardardDeviation", "Skewness", "Kurtosis",
+                                   "Description")))
+
+for (i in 1:ncol(credit.data.csv)) {
+    des.data[i, 1] <-class(credit.data.csv[, i])
+    des.data[i, 2] <-length(unique(credit.data.csv[, i]))
+    des.data[i, 3] <-sum(is.na(credit.data.csv[, i]))
+}
+
+```
+
+#### Removing missing values
+
+```{r, fig.width=15, fig.height=6, warning=FALSE}
+# removing rows with NA values
+credit.data <- na.omit(credit.data.csv)
+# checking again after removal
+which(is.na(credit.data))
+
+# the vector of column numbers for factor-type variables
+rnum_factor <- as.vector(which(des.data[,"Type"] == "factor"))
+```
+
+### Feature Selection with imbalanced Data (Same as in Part-1)
+
+```{r, Feature engineering, warning=FALSE, message=FALSE}
+# imbalance data
+table(credit.data$Offer.Accepted)
+# due to linear relationship between Average.Balance and quarterly balance
+# we will remove the quarterly number to avoid multicollinearity
+my.df <- credit.data[,c(1:12)]
+for (n in 1:7) {
+  my.df[, rnum_factor[n]] <- my.df[,rnum_factor[n]] %>% as.numeric()
+}
+
+# Standardize predictor
+# 0 - Not accepted
+# 1 - Accepted
+my.df$Offer.Accepted <- my.df$Offer.Accepted - 1
+
+# dividing househols size in single/family
+# 1 = single
+# 2 = couple of family = 2 or more
+my.df$Family.type[my.df$Household.Size <= 1] <- 1
+my.df$Family.type[my.df$Household.Size > 1] <- 2
+
+# create a new feature from Average.Balance divided by Household.Size 
+# to measure the financial soundness of the famility
+my.df$Average.Balance.Household.Size <- my.df$Average.Balance / my.df$Household.Size
+
+# remove Average.Balance and Household.Size after new feature is being keyed
+my.df <- my.df[,c(2:9,11,13,14,1)]
+colnames(my.df)
+```
+
+### Experiment Setup   
+
+##### Why Under Sampling and XGBoost ?      
+- Looking at part 1 results for different models with various sampling method, we conclude that under-sampling gace "balanced" results between specificy and sensitivity.
+- We decided to further explore under sampling with one of the most popular models at the moment i.e. XGBoost.
+- XGBoost is one of top implementations of Gradient Boosting and the weighted approach might help us to improve results especially with improvement in Sensitivity (True Positive Rate) and Specificity (True Negative Rate)
+
+##### Train/Test split   
+- As under-sampling gives us limited training data, we tried train-test split of 80-20 and 75-25.
+- Based on evaluation metric results, 80-20 performed better and hence we prefer to use 80-20 split approach on this dataset.
+
+##### Feature Selection   
+- Feature selection was performed using simple linear model that minimised error
+- Top 8 features were selected for pre-processing
+
+```{r, Train Test Split, warning=FALSE, message=FALSE}
+set.seed(123)
+## split data into 75% train and 25% test
+## split data into 80% train and 20% test
+inTrain<- createDataPartition(my.df$Offer.Accepted, p= 0.8)[[1]]
+mytrain<- my.df[inTrain, ]
+mytest<- my.df[-inTrain, ]
+
+# Under Sampling
+mytrain.Bal <- ovun.sample(Offer.Accepted ~ ., data = mytrain, method = "under",
+                           seed = 123)$data
+mytest.Bal <- ovun.sample(Offer.Accepted ~ ., data = mytest, method = "under",
+                           seed = 123)$data
+
+# Total positive samples in train data
+table(mytrain$Offer.Accepted)
+# Check the imbalance of data now
+table(mytrain.Bal$Offer.Accepted)
+table(mytest.Bal$Offer.Accepted)
+cls.mytrain <- mytrain.Bal$Offer.Accepted
+cls.mytest<- mytest.Bal$Offer.Accepted
+
+cls.mytrain.Bal <- mytrain.Bal$Offer.Accepted
+
+# Create feature selection pocket
+my.features <- c()
+
+# Run Accuracy check for the 1st feature
+my.acc.first<-c()
+for (i in 1:(ncol(mytrain.Bal) - 1)) {
+  model <- lm(data=mytrain.Bal[, c(i, ncol(mytrain.Bal))], Offer.Accepted~.)
+  yhat <- ifelse(predict.lm(model, mytest.Bal[, c(i, ncol(mytrain.Bal))]) > 0.5, 1, 0)
+  acm <- confusionMatrix(as.factor(yhat),as.factor(cls.mytest))
+  a <- acm$overall["Accuracy"]
+  my.acc.first<-c(my.acc.first, a)
+}
+# find the name of the feature who produced minimal MSE
+my.acc.first.max <- colnames(mytest.Bal)[which(my.acc.first== max(my.acc.first))][1]
+my.features<- c(my.features, my.acc.first.max)
+print(my.features)
+
+# Find the next 7 features
+my.acc <- my.acc.first
+for (j in 1:6) {
+  current.max.acc <- -Inf
+  selected.i <- NULL
+
+  for(i in 1: (ncol(mytrain.Bal) - 1)) {
+
+    current.f <- colnames(mytrain.Bal)[i]
+   
+    if(current.f %in% c(my.features, "Offer.Accepted")) {next}
+    model <- lm(data=mytrain.Bal[, c(my.features, current.f, "Offer.Accepted")], Offer.Accepted~.)
+   
+    yhat <- ifelse(predict.lm(model, 
+                              mytest.Bal[, c(my.features, current.f, "Offer.Accepted")]) > 0.5, 
+                              1, 0)
+    # calculate the confusion matrix
+    newacm <- confusionMatrix(as.factor(yhat),as.factor(cls.mytest))
+    newa <- newacm$overall["Accuracy"]
+    # find the max accuracy 
+      if(newa > current.max.acc) {
+        current.max.acc <- newa
+        selected.i <- colnames(mytrain.Bal)[i]
+      }
+    }
+  # append the feature into the vector when max accuracy is found
+  my.features <- c(my.features, selected.i)
+ 
+}
+# The top 8 features
+```
+
+> Top 7 Features are : `r my.features`
+
+### Feature pre-processing
+- The top 7 features are categorical variables
+- One hot encoding was performed using Keras Dummtvars
+- Train and Test data was merged to make sure all levels of samples were represented in encoded set
+- A dummy column was created to identify train and test data in combined dataset.
+Train=1 -> Training Data
+Train=0 -> Test Data
+
+```{r, Train Test, warning=FALSE, message=FALSE}
+# https://medium.com/@vaibhavshukla182/how-to-solve-mismatch-in-train-and-test-set-after-categorical-encoding-8320ed03552f
+mytrain.Bal <- mytrain.Bal[,c(which(colnames(mytrain.Bal) %in% my.features),12)]
+mytest.Bal <- mytest.Bal[,c(which(colnames(mytest.Bal) %in% my.features),12)]
+
+# Create Train / Test Identifier
+mytrain.Bal['train'] <- 1
+mytest.Bal['train'] <- 0
+
+# Combine Data
+combined.data <- rbind(mytrain.Bal, mytest.Bal)
+combined.data[,!(names(combined.data) %in% c("Average.Balance.Household.Size",
+                                             "Offer.Accepted" , "train"))] <-lapply(combined.data[,!(names(combined.data) %in% c("Average.Balance.Household.Size","Offer.Accepted" ,"train"))], factor)
+
+dummies <- dummyVars(~ ., data =  combined.data[,!(names(combined.data) %in% c("Average.Balance.Household.Size","Offer.Accepted" ,"train"))])
+
+trsf.data <- data.frame(predict(dummies, newdata = combined.data))
+trsf.df <- cbind(trsf.data, combined.data[,(names(combined.data) %in% c("Average.Balance.Household.Size","Offer.Accepted" ,"train"))])
+
+# Split data back to train and test
+train.data <- trsf.df[trsf.df$train == 1,!(names(trsf.df) %in% c("train"))]
+test.data <- trsf.df[trsf.df$train == 0,!(names(trsf.df) %in% c("train"))]
+cls.train <- trsf.df$Offer.Accepted[trsf.df$train == 1]
+cls.test<- trsf.df$Offer.Accepted[trsf.df$train == 0]
+```
+
+## Classification Model
+
+### Modeling Approach   
+1. Top 7 features selected from available feature set
+2. Data pre-processing with one hot encoding of categorical features
+3. Hyper tuning XGBoost with 10-fold and 5-fold cross validation. 
+Based on test results, 10-fold cross validation was selected for final modeling.
+
+##### Let's start with HyperParameter Tuning...
+
+```{r, Hyper Parameter Tuning}
+set.seed(123)
+# Create Search Grid
+searchGrid <- expand.grid(eta_values = c(0.01, 0.05, 0.1),
+                          max_depth_values = c(4, 6, 8),
+                          gamma_values = c(1, 5),
+                          min_child_weight_values = c(1, 2,4))
+
+# Test Grid 
+# searchGrid <- expand.grid(eta_values = c(0.001),
+#                           max_depth_values = c(2,3),
+#                           gamma_values = c(5),
+#                           min_child_weight_values = c(2))
+
+# xgb Matrix for input
+dtrain <- xgb.DMatrix(data = as.matrix(train.data[,!(names(train.data) %in% c("Offer.Accepted"))]),
+                              label = train.data$Offer.Accepted)
+dtest <- xgb.DMatrix(data = as.matrix( test.data[,!(names(test.data) %in% c("Offer.Accepted"))]),
+                             label = test.data$Offer.Accepted)
+
+xgbst.results <- apply(searchGrid, 1, function(parameterList){
+        #Extract Parameters to validate
+        current_eta <- parameterList[["eta_values"]]
+        current_depth <- parameterList[["max_depth_values"]]
+        current_gamma <- parameterList[["gamma_values"]]
+        current_child_weight <- parameterList[["min_child_weight_values"]]
+        
+        param <- list(objective = "binary:logistic",
+                      eta = current_eta,
+                      max_depth = current_depth,
+                      gamma = current_gamma,
+                      min_child_weight = current_child_weight)
+        
+        xgb.cv.model <- xgb.cv(params = param,
+                               data = dtrain,
+                               metrics = "logloss", #minimise logloss
+                               nrounds = 500,
+                               nfold = 10, # 10 fold gives better result than 5 fold
+                               early_stopping_rounds = 15,
+                               verbose = F)
+        
+        return(list(p = param,
+                    loss = min(xgb.cv.model$evaluation_log$test_logloss_mean),
+                    round = xgb.cv.model$best_iteration))
+})
+```
+
+### Find Best Parameters
+
+```{r, best params}
+best.logloss <- 100
+best.params <- c()
+best.iter <- 0
+for (i in 1:length(xgbst.results)){
+      if (xgbst.results[[i]]$loss < best.logloss) {
+        best.logloss <- xgbst.results[[i]]$loss
+        best.params <- xgbst.results[[i]]$p
+        best.iter <- xgbst.results[[i]]$round
+      } else {
+      }
+}
+
+# Best parameters
+best.params
+# Best iterations for boosting
+best.iter
+# Minimum loss value
+best.logloss
+```
+
+### Train model on best parameters
+
+```{r, train and test xgboost}
+xgb.model <- xgb.train(params = best.params,
+                       data = dtrain,
+                       metrics = "logloss",
+                       nrounds = best.iter,
+                       print_every_n=10,
+                       verbose = T)
+```
+
+### Evaluation and Conclusion  
+
+##### Pros   
+- Based on evaluation metric, Decision Tree and XGBoost give better results with Under Sampling
+
+##### Cons
+- All models suffer from low specificity – given trials on various sampling techniques, this points to data incompleteness
+
+##### Conclusion   
+- A successful credit card campaign will rely on following parameters
+1) How the client is approached? i.e. by a Letter or a Postcard
+2) What kind of rewards are on offer? i.e. Air Miles, Cash Back or Points
+3) What is the Credit Rating of the client and How many Credit Cards a client holds?
+4) Home owenership plays crucial role in client's decision to accept or reject the offer.
+
+##### Further Improvements     
+- A relatively low sensitivity scores points to bias prediction value of 1.
+The model can be further improved with gathering more successful cases, which can allow us to use under sampling in more effective manner.
+
+```{r, train and test}
+offer.pred.prob <- predict(xgb.model, newdata = dtest)
+offer.pred <- ifelse (offer.pred.prob > 0.5,1,0)
+conf.mat <- confusionMatrix(as.factor(offer.pred),
+                      as.factor(test.data$Offer.Accepted))
+
+# Confusion Matrix
+conf.mat
+
+x.axis <- c("Accuracy", "F1", "Precision", "Recall", "Sensitivity", "Specificity")
+y.axis <- c(conf.mat$overall["Accuracy"],
+            conf.mat$byClass["F1"],
+            conf.mat$byClass["Precision"],
+            conf.mat$byClass["Recall"],
+            conf.mat$byClass["Sensitivity"],
+            conf.mat$byClass["Specificity"])
+
+d <- data.frame(x = x.axis, y = y.axis)
+ggplot(d) +geom_point(aes(x, y), color = "blue") +
+  ylim(0,1) +
+  xlab(label = "Measurement") +
+  ylab(label ="Value") +
+  labs(title = "Hypertuned XGBoost with Under Sampling",
+       caption = "Group 18, STAT 5003, University of Sydney")
+```
+
+### ROC Curve - Sensitivity vs Specificity   
+
+```{r, roc curve}
+pROC_obj <- roc(test.data$Offer.Accepted,
+                offer.pred,
+                smoothed = TRUE,
+                # arguments for ci
+                ci=TRUE, ci.alpha=0.9, stratified=FALSE,
+                # arguments for plot
+                plot=TRUE, auc.polygon=TRUE, max.auc.polygon=TRUE, grid=TRUE,
+                print.auc=TRUE, show.thres=TRUE)
+
+
+sens.ci <- ci.se(pROC_obj)
+plot(sens.ci, type="shape", col="lightblue")
+plot(sens.ci, type="bars")
+```
+
+#### Session Information
+
+```{r, session information display}
+# sessionInfo()
+```
